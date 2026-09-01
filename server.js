@@ -31,6 +31,7 @@
  *   WEBHOOK_PATH     … Webhookの受け口パス（推測されない文字列）
  *   NOTIFY_API_KEY   … 各サービスが送信APIを叩くときの鍵
  *   OWNER_ID         … 運営（三上様）のuserId。登録通知や失敗通知を送る先
+ *   ADMIN_USER/PASS  … 運営画面 /admin のBasic認証。未設定なら運営画面は出さない
  *   DB_PATH          … SQLiteの置き場所（既定 /app/data/hub.db）
  */
 const http = require('http');
@@ -47,6 +48,8 @@ const PUBLIC_URL = (process.env.PUBLIC_URL || 'https://notify.s-toru.com').repla
 const WEBHOOK_PATH = process.env.WEBHOOK_PATH || 'webhook';
 const NOTIFY_API_KEY = process.env.NOTIFY_API_KEY || '';
 const OWNER_ID = process.env.OWNER_ID || '';
+const ADMIN_USER = process.env.ADMIN_USER || '';
+const ADMIN_PASS = process.env.ADMIN_PASS || '';
 const DB_PATH = process.env.DB_PATH || '/app/data/hub.db';
 const PORT = process.env.PORT || 3000;
 
@@ -501,6 +504,186 @@ function handleRecipients(method, body, res) {
   });
 }
 
+// ── 運営画面：三上様がブラウザから使う ─────────────────────
+//
+// これが無いと、お客様の追加も、臨時のお知らせ送信も、毎回こちらの作業になる。
+// 月刊HANDS NOTEの新刊のお知らせ、LP制作の「公開しました」の連絡など、
+// サービスごとに仕組みを作るより、ここから送れるようにするほうが早い。
+//
+// 入口はBasic認証。ADMIN_USER / ADMIN_PASS が未設定なら画面ごと出さない
+// （既定のパスワードで開いてしまう事故を防ぐため）。
+function adminAuthed(req) {
+  if (!ADMIN_USER || !ADMIN_PASS) return false;
+  const h = req.headers.authorization || '';
+  if (!/^Basic /i.test(h)) return false;
+  const [u, p] = Buffer.from(h.slice(6), 'base64').toString('utf8').split(':');
+  const ok = (a, b) => {
+    const x = Buffer.from(String(a)), y = Buffer.from(String(b));
+    return x.length === y.length && crypto.timingSafeEqual(x, y);
+  };
+  return ok(u, ADMIN_USER) && ok(p, ADMIN_PASS);
+}
+
+function adminChallenge(res) {
+  res.writeHead(401, { 'WWW-Authenticate': 'Basic realm="shittoru-notify-hub"' });
+  res.end('unauthorized');
+}
+
+const ADMIN_CSS = PAGE_CSS + `
+  .wrap{max-width:840px}
+  table{width:100%;border-collapse:collapse;font-size:14px}
+  th,td{text-align:left;padding:10px 8px;border-bottom:1px solid #e6e9eb;vertical-align:top}
+  th{font-size:12px;color:#5a6b74;font-weight:600;white-space:nowrap}
+  .tag{display:inline-block;font-size:12px;padding:2px 9px;border-radius:99px}
+  .yes{background:#e6f4ec;color:#146c3a}
+  .no{background:#fdeeee;color:#a3282f}
+  .url{font-family:ui-monospace,Menlo,monospace;font-size:12px;word-break:break-all;color:#0E8388}
+  form{margin:0}
+  input[type=text],textarea,select{width:100%;padding:11px 12px;border:1px solid #ccd4d8;border-radius:8px;
+    font:inherit;font-size:15px;background:#fff;color:#0E2A38}
+  textarea{min-height:150px;resize:vertical;line-height:1.7}
+  label{display:block;font-size:13px;font-weight:600;margin:16px 0 6px}
+  .go{background:#0E8388;color:#fff;border:0;border-radius:8px;padding:14px 22px;font:inherit;
+    font-size:16px;font-weight:700;cursor:pointer;margin-top:18px}
+  .warn{background:#fff8ec;border:1px solid #f0dcc0;border-radius:9px;padding:14px 16px;font-size:14px;margin:0 0 18px}
+  .ok{background:#eef7f1;border:1px solid #cfe6d8;border-radius:9px;padding:14px 16px;font-size:14px;margin:0 0 18px}
+  .ng{background:#fdeeee;border:1px solid #f0c9cb;border-radius:9px;padding:14px 16px;font-size:14px;margin:0 0 18px}
+  .scroll{overflow-x:auto}
+
+  /* スマホでは表が窮屈になるので、1件ずつのカードに組み替える。
+     三上様が外出先で開くことを想定している。 */
+  @media (max-width: 640px) {
+    .card{padding:20px 16px}
+    table, tbody, tr, td { display:block; width:100% }
+    thead { display:none }
+    tr { border-bottom:1px solid #e6e9eb; padding:14px 0 }
+    tr:last-child { border-bottom:0 }
+    td { border:0; padding:2px 0 }
+    td::before { content:attr(data-l); display:block; font-size:11px; color:#5a6b74; margin:8px 0 2px }
+    td:first-child::before { display:none }
+  }
+`;
+
+function adminPage(notice) {
+  const rows = db.prepare('SELECT * FROM recipients ORDER BY created_at').all();
+  const list = rows.length
+    ? rows.map((r) => {
+        let sv = [];
+        try { sv = JSON.parse(r.services || '[]'); } catch { sv = []; }
+        return `<tr>
+          <td><strong>${esc(r.shop_name)}</strong><br>
+              <span class="url">${esc(r.code)}</span></td>
+          <td data-l="連携">${r.line_user_id ? '<span class="tag yes">連携済み</span>' : '<span class="tag no">まだ</span>'}</td>
+          <td data-l="ご利用中">${sv.length ? sv.map((s) => esc(s.name)).join('<br>') : '<span style="color:#98a4aa">なし</span>'}</td>
+          <td data-l="お渡しする連携リンク"><span class="url">${esc(linkUrl(r.code))}</span></td>
+        </tr>`;
+      }).join('')
+    : '<tr><td colspan="4" style="color:#98a4aa">まだ登録がありません</td></tr>';
+
+  const options = rows
+    .filter((r) => r.line_user_id)
+    .map((r) => `<option value="${esc(r.code)}">${esc(r.shop_name)}（${esc(r.code)}）</option>`)
+    .join('');
+
+  const sendForm = options
+    ? `<form method="POST" action="/admin/send">
+         <label>送り先</label>
+         <select name="code" required>
+           <option value="">選んでください</option>
+           <option value="*">連携済みの全員に送る</option>
+           ${options}
+         </select>
+         <label>本文</label>
+         <textarea name="text" required placeholder="例）月刊 HANDS NOTE の9月号を公開しました。ポータルからご覧いただけます。"></textarea>
+         <p class="note">押すとすぐ届きます。送る前にもう一度読み返してください。取り消しはできません。</p>
+         <button class="go" type="submit">送信する</button>
+       </form>`
+    : `<p class="note">まだ連携済みのお店がありません。上の連携リンクをお渡しして、連携が済んでから送信できます。</p>`;
+
+  return `<!doctype html><html lang="ja"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="robots" content="noindex,nofollow">
+<title>しっとる通知ハブ 運営画面</title><style>${ADMIN_CSS}</style></head>
+<body><div class="wrap">
+  <div class="card">
+    <p class="brand">しっとる お知らせ用LINE</p>
+    <h1>運営画面</h1>
+    ${notice || ''}
+
+    <h2 style="margin-top:24px">お店の一覧</h2>
+    <div class="scroll"><table>
+      <thead><tr><th>お店 / コード</th><th>連携</th><th>ご利用中</th><th>お渡しする連携リンク</th></tr></thead><tbody>
+      ${list}
+    </tbody></table></div>
+
+    <hr>
+    <h2>お店を追加する</h2>
+    <p class="note">追加すると連携リンクができます。そのリンクをお客様にお送りしてください。</p>
+    <form method="POST" action="/admin/add">
+      <label>お店の名前</label>
+      <input type="text" name="shopName" required placeholder="例）さくら整骨院">
+      <button class="go" type="submit">追加する</button>
+    </form>
+
+    <hr>
+    <h2>お知らせを送る</h2>
+    <div class="warn">ここから送ると、お客様のLINEにそのまま届きます。新刊のお知らせ、公開のご連絡などにお使いください。</div>
+    ${sendForm}
+  </div>
+  <p class="foot">株式会社しっとる</p>
+</div></body></html>`;
+}
+
+/** application/x-www-form-urlencoded を読む */
+function parseForm(raw) {
+  const out = {};
+  for (const pair of String(raw || '').split('&')) {
+    if (!pair) continue;
+    const i = pair.indexOf('=');
+    const k = decodeURIComponent((i < 0 ? pair : pair.slice(0, i)).replace(/\+/g, ' '));
+    const v = i < 0 ? '' : decodeURIComponent(pair.slice(i + 1).replace(/\+/g, ' '));
+    out[k] = v;
+  }
+  return out;
+}
+
+async function handleAdminSend(form, res) {
+  const text = String(form.text || '').trim();
+  const code = String(form.code || '').trim().toUpperCase();
+  if (!text || !code) return html(res, 400, adminPage('<div class="ng">送り先と本文の両方が要ります。</div>'));
+
+  const targets =
+    code === '*'
+      ? db.prepare('SELECT * FROM recipients WHERE line_user_id IS NOT NULL').all()
+      : db.prepare('SELECT * FROM recipients WHERE code = ? AND line_user_id IS NOT NULL').all(code);
+  if (!targets.length) return html(res, 404, adminPage('<div class="ng">送り先が見つかりませんでした。</div>'));
+
+  const okNames = [], ngNames = [];
+  for (const t of targets) {
+    const r = await push(t.line_user_id, text);
+    db.prepare('INSERT INTO sends (code, service, ok, detail, text, created_at) VALUES (?, ?, ?, ?, ?, ?)')
+      .run(t.code, 'oshirase', r.ok ? 1 : 0, r.ok ? null : r.text.slice(0, 200), text, now());
+    (r.ok ? okNames : ngNames).push(t.shop_name);
+  }
+  const parts = [];
+  if (okNames.length) parts.push(`<div class="ok">送信しました：${esc(okNames.join('、'))}</div>`);
+  if (ngNames.length) parts.push(`<div class="ng">送れませんでした：${esc(ngNames.join('、'))}</div>`);
+  return html(res, 200, adminPage(parts.join('')));
+}
+
+function handleAdminAdd(form, res) {
+  const shopName = String(form.shopName || '').trim();
+  if (!shopName) return html(res, 400, adminPage('<div class="ng">お店の名前を入れてください。</div>'));
+  const c = newCode();
+  db.prepare('INSERT INTO recipients (code, shop_name, created_at) VALUES (?, ?, ?)').run(c, shopName, now());
+  return html(
+    res,
+    200,
+    adminPage(`<div class="ok">${esc(shopName)} を追加しました。<br>この連携リンクをお渡しください：<br>
+      <span class="url">${esc(linkUrl(c))}</span></div>`)
+  );
+}
+
 // ── サーバー ──────────────────────────────────────────────
 http
   .createServer((req, res) => {
@@ -510,6 +693,30 @@ http
       const n = db.prepare('SELECT COUNT(*) c FROM recipients').get().c;
       const linked = db.prepare('SELECT COUNT(*) c FROM recipients WHERE line_user_id IS NOT NULL').get().c;
       return json(res, 200, { ok: true, recipients: n, linked });
+    }
+
+    // 運営画面（Basic認証）
+    if (url === '/admin' || url.startsWith('/admin/')) {
+      if (!ADMIN_USER || !ADMIN_PASS) { res.writeHead(404); return res.end(); }
+      if (!adminAuthed(req)) return adminChallenge(res);
+      if (req.method === 'GET' && url === '/admin') return html(res, 200, adminPage(''));
+      if (req.method === 'POST') {
+        let raw = '';
+        req.on('data', (c) => (raw += c));
+        req.on('end', async () => {
+          try {
+            const form = parseForm(raw);
+            if (url === '/admin/add') return handleAdminAdd(form, res);
+            if (url === '/admin/send') return await handleAdminSend(form, res);
+            res.writeHead(404); res.end();
+          } catch (e) {
+            console.error('admin error', e.message);
+            html(res, 500, adminPage('<div class="ng">エラーが起きました。もう一度お試しください。</div>'));
+          }
+        });
+        return;
+      }
+      res.writeHead(405); return res.end();
     }
 
     // お客様が開く連携ページ（認証なし。コードは推測できない文字列にしてある）
