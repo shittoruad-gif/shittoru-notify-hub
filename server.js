@@ -458,17 +458,47 @@ function handleRecipients(method, body, res) {
   if (!shopName) return json(res, 400, { error: 'shopName は必須です' });
   // コードは自動発行する。運営が手で決めると推測できてしまうため。
   const c = code ? String(code).toUpperCase() : newCode();
-  // services は [{name, url}] の配列。リッチメニューの「ご利用中のサービス」で返す。
-  const sv = Array.isArray(services)
-    ? JSON.stringify(services.filter((s) => s && s.name && s.url).map((s) => ({ name: String(s.name), url: String(s.url) })))
+
+  const clean = Array.isArray(services)
+    ? services.filter((s) => s && s.name && s.url).map((s) => ({ name: String(s.name), url: String(s.url) }))
     : null;
-  db.prepare(
-    `INSERT INTO recipients (code, shop_name, services, created_at) VALUES (?, ?, ?, ?)
-     ON CONFLICT(code) DO UPDATE SET shop_name = excluded.shop_name,
-       services = COALESCE(excluded.services, recipients.services)`
-  ).run(c, shopName, sv, now());
-  const saved = db.prepare('SELECT services FROM recipients WHERE code = ?').get(c);
-  return json(res, 200, { ok: true, code: c, shopName, services: JSON.parse(saved.services || '[]'), linkUrl: linkUrl(c) });
+
+  const existing = db.prepare('SELECT * FROM recipients WHERE code = ?').get(c);
+
+  /**
+   * サービス一覧は「足す」。置き換えない。
+   *
+   * 1つのお店が口コミアプリとKeiroの両方を使うことがある。
+   * それぞれのアプリが自分のぶんだけを送ってくるので、
+   * 上書きにすると後から登録したほうだけが残り、もう一方が消える。
+   * 名前をキーにして、同じ名前ならURLを新しいほうで更新する。
+   */
+  let merged = clean;
+  if (existing && clean) {
+    let prev = [];
+    try { prev = JSON.parse(existing.services || '[]'); } catch { prev = []; }
+    const byName = new Map(prev.map((s) => [s.name, s]));
+    for (const s of clean) byName.set(s.name, s);
+    merged = [...byName.values()];
+  }
+
+  if (existing) {
+    db.prepare('UPDATE recipients SET shop_name = ?, services = COALESCE(?, services) WHERE code = ?')
+      .run(shopName, merged ? JSON.stringify(merged) : null, c);
+  } else {
+    db.prepare('INSERT INTO recipients (code, shop_name, services, created_at) VALUES (?, ?, ?, ?)')
+      .run(c, shopName, merged ? JSON.stringify(merged) : null, now());
+  }
+
+  const saved = db.prepare('SELECT * FROM recipients WHERE code = ?').get(c);
+  return json(res, 200, {
+    ok: true,
+    code: c,
+    shopName,
+    services: JSON.parse(saved.services || '[]'),
+    linked: Boolean(saved.line_user_id),
+    linkUrl: linkUrl(c),
+  });
 }
 
 // ── サーバー ──────────────────────────────────────────────
