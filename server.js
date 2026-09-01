@@ -40,6 +40,7 @@ const fs = require('fs');
 const path = require('path');
 const Database = require('better-sqlite3');
 const QRCode = require('qrcode');
+const SETUP = require('./setup');
 
 const LINE_TOKEN = process.env.LINE_TOKEN || '';
 const LINE_SECRET = process.env.LINE_SECRET || '';
@@ -89,6 +90,8 @@ for (const [table, col, ddl] of [
   const has = db.prepare(`PRAGMA table_info(${table})`).all().some((c) => c.name === col);
   if (!has) db.exec(ddl);
 }
+
+SETUP.ensureTable(db);
 
 const now = () => Date.now();
 const json = (res, code, obj) => {
@@ -504,6 +507,114 @@ function handleRecipients(method, body, res) {
   });
 }
 
+// ── 初期ヒアリング画面（クライアントが入力する） ──────────────
+const SETUP_CSS = PAGE_CSS + `
+  label{display:block;font-size:13px;font-weight:600;margin:14px 0 5px}
+  input[type=text],textarea{width:100%;padding:11px 12px;border:1px solid #ccd4d8;border-radius:8px;
+    font:inherit;font-size:16px;background:#fff;color:#0E2A38}
+  textarea{min-height:110px;resize:vertical;line-height:1.7}
+  .sec{border-top:1px solid #e6e9eb;margin:30px 0 0;padding:26px 0 0}
+  .sec h2{font-size:18px;margin:0 0 4px}
+  .sec .why{font-size:13px;color:#5a6b74;margin:0 0 6px}
+  .rep{background:#f7f9fa;border-radius:10px;padding:4px 14px 16px;margin:14px 0 0}
+  .rep .n{font-size:12px;font-weight:700;color:#0E8388;margin:14px 0 0}
+  .chk{display:flex;gap:10px;align-items:flex-start;padding:11px 0;border-bottom:1px solid #eef1f2;font-size:15px}
+  .chk input{width:20px;height:20px;margin:2px 0 0;flex:0 0 auto}
+  .bar{position:sticky;bottom:0;background:#fff;border-top:1px solid #e6e9eb;padding:14px 0 4px;margin:26px 0 0;
+    display:flex;gap:10px}
+  .bar button{flex:1;border:0;border-radius:9px;padding:15px 10px;font:inherit;font-size:16px;font-weight:700;cursor:pointer}
+  .keep{background:#eef2f3;color:#0E2A38}
+  .send{background:#0E8388;color:#fff}
+  .ok{background:#eef7f1;border:1px solid #cfe6d8;border-radius:10px;padding:16px 18px;margin:0 0 20px;font-size:15px}
+  .lead{font-size:15px;margin:0 0 4px}
+`;
+
+function setupField(f, name, val) {
+  const long = f.k === 'free_note';
+  const input = long
+    ? `<textarea name="${name}" placeholder="${esc(f.ph || '')}">${esc(val)}</textarea>`
+    : `<input type="text" name="${name}" value="${esc(val)}" placeholder="${esc(f.ph || '')}">`;
+  return `<label>${esc(f.l)}${f.req ? '' : '<span style="font-weight:400;color:#98a4aa">（任意）</span>'}</label>${input}`;
+}
+
+function setupPage(row, state, notice) {
+  const d = state.data || {};
+  const v = (k) => String(d[k] ?? '');
+  let body = '';
+  for (const s of SETUP.SECTIONS) {
+    body += `<div class="sec"><h2>${esc(s.title)}</h2><p class="why">${esc(s.note)}</p>`;
+    if (s.repeat) {
+      body += '<div class="rep">';
+      for (let i = 1; i <= s.repeat; i++) {
+        body += `<p class="n">${esc(s.repeatLabel)} ${i}</p>`;
+        for (const f of s.fields) body += setupField(f, `${s.key}_${i}_${f.k}`, v(`${s.key}_${i}_${f.k}`));
+      }
+      body += '</div>';
+    } else {
+      for (const f of s.fields) body += setupField(f, `${s.key}_${f.k}`, v(`${s.key}_${f.k}`));
+    }
+    body += '</div>';
+  }
+
+  body += `<div class="sec"><h2>お使いになる機能</h2>
+    <p class="why">迷われたら、いまお使いのものだけで結構です。後からいつでも足せます。</p>`;
+  for (const [k, l] of SETUP.FEATURES) {
+    body += `<label class="chk"><input type="checkbox" name="feature_${k}" value="1"${d['feature_' + k] ? ' checked' : ''}><span>${esc(l)}</span></label>`;
+  }
+  body += '</div>';
+
+  body += `<div class="sec"><h2>ご要望・特記事項</h2>
+    <p class="why">「こうしてほしい」があれば、なんでもお書きください。</p>
+    <textarea name="free_note" placeholder="例）土曜だけ受付時間を短くしたい">${esc(v('free_note'))}</textarea></div>`;
+
+  const done = state.submitted_at
+    ? `<div class="ok">ご入力ありがとうございました。内容は担当に届いています。<br>
+       追記や修正があれば、書き換えて「この内容で送る」を押してください。</div>`
+    : '';
+
+  return pageShell(
+    '初期設定のご入力',
+    `<p class="brand">サロンカルテ 初期設定</p>
+     <h1>ご開設の準備</h1>
+     <p class="shop">${esc(row.shop_name)} 様</p>
+     ${notice || ''}${done}
+     <p class="lead">お店の情報をご入力いただければ、<strong>お打ち合わせのお時間をいただかずに</strong>ご開設まで進みます。</p>
+     <p class="note">途中でやめても大丈夫です。「途中まで保存」を押しておけば、このページを開き直すと続きから書けます。分からない欄は空欄で構いません。</p>
+     <form method="POST" action="/setup/${esc(row.code)}">
+       ${body}
+       <div class="bar">
+         <button class="keep" type="submit" name="action" value="keep">途中まで保存</button>
+         <button class="send" type="submit" name="action" value="send">この内容で送る</button>
+       </div>
+     </form>`
+  ).replace(PAGE_CSS, SETUP_CSS);
+}
+
+async function handleSetup(method, code, raw, res) {
+  const row = db.prepare('SELECT * FROM recipients WHERE code = ?').get(String(code).toUpperCase());
+  if (!row) {
+    return html(res, 404, pageShell('見つかりません',
+      `<p class="brand">サロンカルテ 初期設定</p><h1>このリンクは使えません</h1>
+       <p class="shop">お手数ですが、担当までご連絡ください。</p>`));
+  }
+
+  if (method === 'GET') return html(res, 200, setupPage(row, SETUP.load(db, row.code), ''));
+
+  const form = parseForm(raw);
+  const send = form.action === 'send';
+  const data = {};
+  for (const [k, val] of Object.entries(form)) { if (k !== 'action') data[k] = val; }
+  SETUP.save(db, row.code, data, send);
+
+  if (send && OWNER_ID) {
+    await push(OWNER_ID, SETUP.summarize(row.shop_name, data));
+  }
+  const notice = send
+    ? ''
+    : '<div class="ok">ここまでを保存しました。このページを開き直すと、続きから書けます。</div>';
+  return html(res, 200, setupPage(row, SETUP.load(db, row.code), notice));
+}
+
 // ── 運営画面：三上様がブラウザから使う ─────────────────────
 //
 // これが無いと、お客様の追加も、臨時のお知らせ送信も、毎回こちらの作業になる。
@@ -713,6 +824,29 @@ http
             console.error('admin error', e.message);
             html(res, 500, adminPage('<div class="ng">エラーが起きました。もう一度お試しください。</div>'));
           }
+        });
+        return;
+      }
+      res.writeHead(405); return res.end();
+    }
+
+    // 初期ヒアリング（クライアントが入力する。コードで本人が分かるのでログイン不要）
+    if (url.startsWith('/setup/')) {
+      const code = decodeURIComponent(url.slice('/setup/'.length));
+      if (req.method === 'GET') {
+        return handleSetup('GET', code, '', res).catch((e) => {
+          console.error('setup error', e.message);
+          html(res, 500, pageShell('エラー', '<h1>表示できませんでした</h1><p>担当までご連絡ください。</p>'));
+        });
+      }
+      if (req.method === 'POST') {
+        let raw = '';
+        req.on('data', (c) => (raw += c));
+        req.on('end', () => {
+          handleSetup('POST', code, raw, res).catch((e) => {
+            console.error('setup post error', e.message);
+            html(res, 500, pageShell('エラー', '<h1>保存できませんでした</h1><p>担当までご連絡ください。</p>'));
+          });
         });
         return;
       }
