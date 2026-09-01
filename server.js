@@ -73,6 +73,20 @@ CREATE TABLE IF NOT EXISTS sends (
 CREATE UNIQUE INDEX IF NOT EXISTS idx_sends_dedupe ON sends(code, dedupe_key) WHERE dedupe_key IS NOT NULL;
 `);
 
+/**
+ * 後から足した列。既存のDBでも動くように、無ければ足す。
+ * services … そのお店がご契約中のサービス [{name,url}] のJSON。
+ *             リッチメニューの「ご利用中のサービス」で、お店ごとの入口を返すために使う。
+ * text     … 送った本文。「今月のレポート」ボタンで読み返せるようにするため。
+ */
+for (const [table, col, ddl] of [
+  ['recipients', 'services', 'ALTER TABLE recipients ADD COLUMN services TEXT'],
+  ['sends', 'text', 'ALTER TABLE sends ADD COLUMN text TEXT'],
+]) {
+  const has = db.prepare(`PRAGMA table_info(${table})`).all().some((c) => c.name === col);
+  if (!has) db.exec(ddl);
+}
+
 const now = () => Date.now();
 const json = (res, code, obj) => {
   res.writeHead(code, { 'Content-Type': 'application/json; charset=utf-8' });
@@ -167,9 +181,75 @@ function findRecipientByText(text) {
   return best;
 }
 
+/**
+ * リッチメニューのボタン（postback）を処理する。
+ *
+ * なぜURLではなくpostbackなのか:
+ *   リッチメニューは全員に同じものが表示される。ボタンにURLを直接入れると、
+ *   全店舗が同じURLに飛んでしまう。かといってお店ごとにメニューを作り分けると、
+ *   ご契約のたびに画像とメニューを1つずつ作ることになり工数が積み上がる。
+ *   postbackなら「押した人のuserId」が届くので、
+ *   メニューは1つのまま、そのお店に合わせた内容を返せる。
+ *
+ * 返信は reply（応答）なので、LINEの配信通数を消費しない。
+ */
+async function handlePostback(ev, userId) {
+  const action = String((ev.postback && ev.postback.data) || '');
+  const row = db.prepare('SELECT * FROM recipients WHERE line_user_id = ?').get(userId);
+
+  if (!row) {
+    return reply(
+      ev.replyToken,
+      'まだ連携が済んでいません。\n担当からお送りした「連携用のリンク」を開いて、青いボタンを押してください。\n\nリンクが見当たらない場合は、担当までご連絡ください。'
+    );
+  }
+
+  if (action === 'report') {
+    const last = db
+      .prepare('SELECT * FROM sends WHERE code = ? AND ok = 1 AND text IS NOT NULL ORDER BY id DESC LIMIT 1')
+      .get(row.code);
+    if (!last) {
+      return reply(
+        ev.replyToken,
+        `${row.shop_name} 様\n\nまだお送りしたレポートがありません。\n毎月1日の朝に、前の月のご利用状況をこちらへお届けします。`
+      );
+    }
+    const d = new Date(last.created_at + 9 * 3600 * 1000);
+    const stamp = `${d.getUTCFullYear()}年${d.getUTCMonth() + 1}月${d.getUTCDate()}日にお送りした内容`;
+    return reply(ev.replyToken, `【${stamp}】\n\n${last.text}`);
+  }
+
+  if (action === 'services') {
+    let list = [];
+    try { list = JSON.parse(row.services || '[]'); } catch { list = []; }
+    if (!list.length) {
+      return reply(
+        ev.replyToken,
+        `${row.shop_name} 様\n\nこちらから開けるサービスの登録がまだありません。\n担当までご連絡いただければ、すぐにご用意します。`
+      );
+    }
+    const body = list.map((s) => `■ ${s.name}\n${s.url}`).join('\n\n');
+    return reply(ev.replyToken, `${row.shop_name} 様\n\nご利用中のサービスです。\n\n${body}`);
+  }
+
+  if (action === 'contact') {
+    if (OWNER_ID) {
+      await push(OWNER_ID, `お客様から「担当に相談する」が押されました。\n\n${row.shop_name}（${row.code}）\n\nこのお客様のトークからご返信ください。`);
+    }
+    return reply(
+      ev.replyToken,
+      `${row.shop_name} 様\n\nご連絡ありがとうございます。担当へお伝えしました。\n折り返しご連絡いたしますので、少々お待ちください。\n\nお急ぎの場合は、このままご用件を書いて送っていただいても大丈夫です。`
+    );
+  }
+
+  return reply(ev.replyToken, '恐れ入ります。もう一度お試しください。');
+}
+
 async function handleEvent(ev) {
   const userId = ev.source && ev.source.userId;
   if (!userId) return;
+
+  if (ev.type === 'postback') return handlePostback(ev, userId);
 
   if (ev.type === 'follow') {
     await reply(ev.replyToken, GUIDE);
@@ -191,7 +271,12 @@ async function handleEvent(ev) {
   const row = findRecipientByText(raw);
   if (!row) {
     if (already) {
-      await reply(ev.replyToken, `${already.shop_name} 様として連携済みです。\n毎月のご利用状況は、こちらへ自動でお送りします。\n\nご不明な点は担当までご連絡ください。`);
+      // 連携済みの方の書き込みは、ご用件とみなして担当へ回す。
+      // 「担当までご連絡ください」と突き放すと、せっかく書いてくださった内容が宙に浮くため。
+      if (OWNER_ID) {
+        await push(OWNER_ID, `お客様からメッセージが届きました。\n\n${already.shop_name}（${already.code}）\n\n${raw.slice(0, 800)}`);
+      }
+      await reply(ev.replyToken, `${already.shop_name} 様\n\nご連絡ありがとうございます。担当へお伝えしました。\n折り返しご連絡いたしますので、少々お待ちください。`);
     } else {
       await reply(ev.replyToken, '恐れ入ります。連携用のリンクから、青いボタンを押してお進みください。\n\nリンクが見当たらない場合は、担当までご連絡ください。こちらからお送りし直します。');
     }
@@ -340,8 +425,8 @@ async function handleNotify(body, res) {
 
   if (dedupeKey) {
     try {
-      db.prepare('INSERT INTO sends (code, service, dedupe_key, created_at) VALUES (?, ?, ?, ?)')
-        .run(row.code, service, dedupeKey, now());
+      db.prepare('INSERT INTO sends (code, service, dedupe_key, text, created_at) VALUES (?, ?, ?, ?, ?)')
+        .run(row.code, service, dedupeKey, text, now());
     } catch {
       return json(res, 200, { skipped: true, reason: '同じ内容を送信済みです' });
     }
@@ -352,8 +437,8 @@ async function handleNotify(body, res) {
     db.prepare('UPDATE sends SET ok = ?, detail = ? WHERE code = ? AND dedupe_key = ?')
       .run(r.ok ? 1 : 0, r.ok ? null : r.text.slice(0, 200), row.code, dedupeKey);
   } else {
-    db.prepare('INSERT INTO sends (code, service, ok, detail, created_at) VALUES (?, ?, ?, ?, ?)')
-      .run(row.code, service, r.ok ? 1 : 0, r.ok ? null : r.text.slice(0, 200), now());
+    db.prepare('INSERT INTO sends (code, service, ok, detail, text, created_at) VALUES (?, ?, ?, ?, ?, ?)')
+      .run(row.code, service, r.ok ? 1 : 0, r.ok ? null : r.text.slice(0, 200), text, now());
   }
   if (!r.ok && OWNER_ID) {
     await push(OWNER_ID, `通知の送信に失敗しました。\nお店: ${row.shop_name}\nサービス: ${service}\n${r.text.slice(0, 150)}`);
@@ -369,14 +454,21 @@ function handleRecipients(method, body, res) {
       .all();
     return json(res, 200, { recipients: rows.map((r) => ({ ...r, linkUrl: linkUrl(r.code) })) });
   }
-  const { shopName, code } = body || {};
+  const { shopName, code, services } = body || {};
   if (!shopName) return json(res, 400, { error: 'shopName は必須です' });
   // コードは自動発行する。運営が手で決めると推測できてしまうため。
   const c = code ? String(code).toUpperCase() : newCode();
+  // services は [{name, url}] の配列。リッチメニューの「ご利用中のサービス」で返す。
+  const sv = Array.isArray(services)
+    ? JSON.stringify(services.filter((s) => s && s.name && s.url).map((s) => ({ name: String(s.name), url: String(s.url) })))
+    : null;
   db.prepare(
-    'INSERT OR REPLACE INTO recipients (code, shop_name, created_at) VALUES (?, ?, COALESCE((SELECT created_at FROM recipients WHERE code = ?), ?))'
-  ).run(c, shopName, c, now());
-  return json(res, 200, { ok: true, code: c, shopName, linkUrl: linkUrl(c) });
+    `INSERT INTO recipients (code, shop_name, services, created_at) VALUES (?, ?, ?, ?)
+     ON CONFLICT(code) DO UPDATE SET shop_name = excluded.shop_name,
+       services = COALESCE(excluded.services, recipients.services)`
+  ).run(c, shopName, sv, now());
+  const saved = db.prepare('SELECT services FROM recipients WHERE code = ?').get(c);
+  return json(res, 200, { ok: true, code: c, shopName, services: JSON.parse(saved.services || '[]'), linkUrl: linkUrl(c) });
 }
 
 // ── サーバー ──────────────────────────────────────────────

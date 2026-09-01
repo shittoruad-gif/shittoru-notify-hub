@@ -1,0 +1,30 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="2500" height="843" viewBox="0 0 2500 843">
+    <rect width="2500" height="843" fill="#FFFFFF"/>
+    <rect x="0" y="0" width="2500" height="8" fill="#0E8388"/>
+    
+      <g transform="translate(356.6666666666667, 210) scale(1.9)"><g stroke="#0E8388" stroke-width="9" fill="none" stroke-linecap="round">
+             <path d="M8 78 L112 78"/>
+             <path d="M30 78 L30 44"/><path d="M60 78 L60 20"/><path d="M90 78 L90 52"/>
+           </g></g>
+      <text x="416.6666666666667" y="590" text-anchor="middle" fill="#0E2A38"
+        font-family="Hiragino Sans, Noto Sans JP, sans-serif" font-size="76" font-weight="600">今月のレポート</text>
+      <text x="416.6666666666667" y="668" text-anchor="middle" fill="#7A888F"
+        font-family="Hiragino Sans, Noto Sans JP, sans-serif" font-size="46">ご利用状況を読み返す</text>
+      <g transform="translate(1190, 210) scale(1.9)"><g stroke="#0E8388" stroke-width="9" fill="none" stroke-linecap="round" stroke-linejoin="round">
+             <rect x="10" y="16" width="42" height="34" rx="7"/>
+             <rect x="68" y="16" width="42" height="34" rx="7"/>
+             <rect x="10" y="62" width="42" height="24" rx="7"/>
+             <rect x="68" y="62" width="42" height="24" rx="7"/>
+           </g></g>
+      <text x="1250" y="590" text-anchor="middle" fill="#0E2A38"
+        font-family="Hiragino Sans, Noto Sans JP, sans-serif" font-size="76" font-weight="600">ご利用中のサービス</text>
+      <text x="1250" y="668" text-anchor="middle" fill="#7A888F"
+        font-family="Hiragino Sans, Noto Sans JP, sans-serif" font-size="46">開く画面のご案内</text><line x1="833.3333333333334" y1="150" x2="833.3333333333334" y2="693" stroke="#DCE3E6" stroke-width="3"/>
+      <g transform="translate(2023.3333333333335, 210) scale(1.9)"><g stroke="#0E8388" stroke-width="9" fill="none" stroke-linecap="round" stroke-linejoin="round">
+             <path d="M12 20 h96 a10 10 0 0 1 10 10 v38 a10 10 0 0 1 -10 10 h-52 l-24 20 v-20 h-20 a10 10 0 0 1 -10 -10 v-38 a10 10 0 0 1 10 -10 z"/>
+           </g></g>
+      <text x="2083.3333333333335" y="590" text-anchor="middle" fill="#0E2A38"
+        font-family="Hiragino Sans, Noto Sans JP, sans-serif" font-size="76" font-weight="600">担当に相談する</text>
+      <text x="2083.3333333333335" y="668" text-anchor="middle" fill="#7A888F"
+        font-family="Hiragino Sans, Noto Sans JP, sans-serif" font-size="46">そのまま書いてもOK</text><line x1="1666.6666666666667" y1="150" x2="1666.6666666666667" y2="693" stroke="#DCE3E6" stroke-width="3"/>
+  </svg>
