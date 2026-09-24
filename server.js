@@ -48,6 +48,9 @@ const LINE_BASIC_ID = process.env.LINE_BASIC_ID || '@163zhsmk';
 const PUBLIC_URL = (process.env.PUBLIC_URL || 'https://notify.s-toru.com').replace(/\/$/, '');
 const WEBHOOK_PATH = process.env.WEBHOOK_PATH || 'webhook';
 const NOTIFY_API_KEY = process.env.NOTIFY_API_KEY || '';
+// お店が書いた内容を、そのサービス側へ回す先（いまはKeiroのみ）。
+// 未設定なら従来どおり、オーナーのLINEへ転送するだけ。
+const KEIRO_INBOUND_URL = process.env.KEIRO_INBOUND_URL || '';
 const OWNER_ID = process.env.OWNER_ID || '';
 const ADMIN_USER = process.env.ADMIN_USER || '';
 const ADMIN_PASS = process.env.ADMIN_PASS || '';
@@ -251,6 +254,33 @@ async function handlePostback(ev, userId) {
   return reply(ev.replyToken, '恐れ入ります。もう一度お試しください。');
 }
 
+/**
+ * Keiroをご契約のお店が書いた内容を、Keiro側へ回して返事の文面をもらう。
+ * なぜKeiroに判断させるか: 修正依頼が今月何件目か・承認待ちの配信があるかは、
+ * ハブには分からない。ハブは配達係に徹する。
+ * @returns {Promise<{replyText:string}|null>} 回せなければ null（呼び出し側は従来動作に落ちる）
+ */
+async function forwardToService(row, text) {
+  if (!KEIRO_INBOUND_URL) return null;
+  let services = [];
+  try { services = JSON.parse(row.services || '[]'); } catch { services = []; }
+  const isKeiro = services.some((sv) => String(sv.name || '').toLowerCase().includes('keiro'));
+  if (!isKeiro) return null;
+  try {
+    const res = await fetch(KEIRO_INBOUND_URL, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: 'Bearer ' + NOTIFY_API_KEY },
+      body: JSON.stringify({ code: row.code, shopName: row.shop_name, text }),
+    });
+    if (!res.ok) { console.error('forward failed', res.status); return null; }
+    const j = await res.json().catch(() => null);
+    return j && j.replyText ? { replyText: j.replyText } : null;
+  } catch (e) {
+    console.error('forward error', e.message);
+    return null;
+  }
+}
+
 async function handleEvent(ev) {
   const userId = ev.source && ev.source.userId;
   if (!userId) return;
@@ -279,6 +309,13 @@ async function handleEvent(ev) {
     if (already) {
       // 連携済みの方の書き込みは、ご用件とみなして担当へ回す。
       // 「担当までご連絡ください」と突き放すと、せっかく書いてくださった内容が宙に浮くため。
+      // Keiroをご契約のお店なら、まずKeiroへ回して返事の文面をもらう
+      // （修正依頼が今月何件目か、承認待ちの配信があるかはKeiroしか知らないため）。
+      const fwd = await forwardToService(already, raw);
+      if (fwd) {
+        await reply(ev.replyToken, fwd.replyText);
+        return;
+      }
       if (OWNER_ID) {
         await push(OWNER_ID, `お客様からメッセージが届きました。\n\n${already.shop_name}（${already.code}）\n\n${raw.slice(0, 800)}`);
       }
@@ -522,6 +559,7 @@ const SETUP_CSS = PAGE_CSS + `
   .chk input{width:20px;height:20px;margin:2px 0 0;flex:0 0 auto}
   .bar{position:sticky;bottom:0;background:#fff;border-top:1px solid #e6e9eb;padding:14px 0 4px;margin:26px 0 0;
     display:flex;gap:10px}
+  select{width:100%;box-sizing:border-box;font:inherit;font-size:16px;padding:12px;border:1px solid #cfd8dc;border-radius:9px;background:#fff;margin:0 0 14px}
   .bar button{flex:1;border:0;border-radius:9px;padding:15px 10px;font:inherit;font-size:16px;font-weight:700;cursor:pointer}
   .keep{background:#eef2f3;color:#0E2A38}
   .send{background:#0E8388;color:#fff}
@@ -531,7 +569,10 @@ const SETUP_CSS = PAGE_CSS + `
 
 function setupField(f, name, val) {
   const long = f.k === 'free_note';
-  const input = long
+  const input = f.type === 'select'
+    ? `<select name="${name}">${(f.options || []).map(([ov, ol]) =>
+        `<option value="${esc(ov)}"${String(val) === ov ? ' selected' : ''}>${esc(ol)}</option>`).join('')}</select>`
+    : long
     ? `<textarea name="${name}" placeholder="${esc(f.ph || '')}">${esc(val)}</textarea>`
     : `<input type="text" name="${name}" value="${esc(val)}" placeholder="${esc(f.ph || '')}">`;
   return `<label>${esc(f.l)}${f.req ? '' : '<span style="font-weight:400;color:#98a4aa">（任意）</span>'}</label>${input}`;
@@ -681,15 +722,22 @@ function adminPage(notice) {
     ? rows.map((r) => {
         let sv = [];
         try { sv = JSON.parse(r.services || '[]'); } catch { sv = []; }
+        const st = SETUP.load(db, r.code);
+        const setupCell = st.submitted_at
+          ? `<span class="tag yes">入力済み</span><br><a href="/admin/setup/${encodeURIComponent(r.code)}.json" target="_blank">設定JSON</a>`
+          : st.updated_at
+          ? `<span class="tag no">途中</span><br><a href="/admin/setup/${encodeURIComponent(r.code)}.json" target="_blank">設定JSON（途中）</a>`
+          : '<span style="color:#98a4aa">未入力</span>';
         return `<tr>
           <td><strong>${esc(r.shop_name)}</strong><br>
               <span class="url">${esc(r.code)}</span></td>
           <td data-l="連携">${r.line_user_id ? '<span class="tag yes">連携済み</span>' : '<span class="tag no">まだ</span>'}</td>
           <td data-l="ご利用中">${sv.length ? sv.map((s) => esc(s.name)).join('<br>') : '<span style="color:#98a4aa">なし</span>'}</td>
+          <td data-l="初期設定">${setupCell}<br><span class="url">${esc(PUBLIC_URL)}/setup/${esc(r.code)}</span></td>
           <td data-l="お渡しする連携リンク"><span class="url">${esc(linkUrl(r.code))}</span></td>
         </tr>`;
       }).join('')
-    : '<tr><td colspan="4" style="color:#98a4aa">まだ登録がありません</td></tr>';
+    : '<tr><td colspan="5" style="color:#98a4aa">まだ登録がありません</td></tr>';
 
   const options = rows
     .filter((r) => r.line_user_id)
@@ -723,7 +771,7 @@ function adminPage(notice) {
 
     <h2 style="margin-top:24px">お店の一覧</h2>
     <div class="scroll"><table>
-      <thead><tr><th>お店 / コード</th><th>連携</th><th>ご利用中</th><th>お渡しする連携リンク</th></tr></thead><tbody>
+      <thead><tr><th>お店 / コード</th><th>連携</th><th>ご利用中</th><th>初期設定</th><th>お渡しする連携リンク</th></tr></thead><tbody>
       ${list}
     </tbody></table></div>
 
@@ -811,6 +859,18 @@ http
       if (!ADMIN_USER || !ADMIN_PASS) { res.writeHead(404); return res.end(); }
       if (!adminAuthed(req)) return adminChallenge(res);
       if (req.method === 'GET' && url === '/admin') return html(res, 200, adminPage(''));
+      // 構築用の設定JSON（moveact-app/scripts/tenant/provision-tenant.mjs に渡す）
+      if (req.method === 'GET' && url.startsWith('/admin/setup/') && url.endsWith('.json')) {
+        const code = decodeURIComponent(url.slice('/admin/setup/'.length, -'.json'.length)).toUpperCase();
+        const row = db.prepare('SELECT * FROM recipients WHERE code = ?').get(code);
+        if (!row) return json(res, 404, { error: 'not found' });
+        const st = SETUP.load(db, code);
+        res.writeHead(200, {
+          'Content-Type': 'application/json; charset=utf-8',
+          'Content-Disposition': `attachment; filename="salonkarte-${code}.json"`,
+        });
+        return res.end(JSON.stringify(SETUP.toSpec(row.shop_name, code, st.data || {}), null, 2));
+      }
       if (req.method === 'POST') {
         let raw = '';
         req.on('data', (c) => (raw += c));
